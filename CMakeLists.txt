@@ -1,4 +1,6 @@
-# formato-v4s / LIBV4S12 - Deterministic Vector Geometry Engine
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# V4S-FORMAT / LIBV4S12 - Deterministic Vector Geometry Engine
 #
 # Copyright (C) 2026 Antonio García Leal (garcialeal)
 #

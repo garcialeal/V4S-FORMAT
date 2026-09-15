@@ -1,7 +1,9 @@
 /*
- * formato-v4s / LIBV4S12 - Deterministic Vector Geometry Engine
+ * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * Copyright (C) 2026 Antonio García Leal (garcialeal)
+ * V4S-FORMAT / LIBV4S12 - Deterministic Vector Geometry Engine
+ *
+ * Copyright (C) 2026 Antonio García Leal <support@v4s12.com>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -10,11 +12,11 @@
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #ifndef V4S12_SPECTRAL_PIPELINE_H
