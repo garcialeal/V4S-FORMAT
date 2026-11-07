@@ -30,6 +30,7 @@
 #include <cstring>
 #include <limits>
 #include <cmath>
+#include <cstddef>
 
 namespace v4s12 {
 
@@ -172,8 +173,16 @@ bool Encoder::write_memory(std::vector<uint8_t>& out_buffer) const {
     };
 
     append_bytes(&hdr, sizeof(Header));
-    if (!nodes_.empty()) {
-        append_bytes(nodes_.data(), nodes_.size() * sizeof(SceneNode));
+
+    // Nodes are serialized field by field so that the 4 padding bytes after
+    // geometry_id are always zero: identical scenes give identical files.
+    for (const auto& n : nodes_) {
+        uint8_t record[sizeof(SceneNode)] = {0};
+        std::memcpy(record + offsetof(SceneNode, geometry_id), &n.geometry_id, sizeof(n.geometry_id));
+        std::memcpy(record + offsetof(SceneNode, transform), n.transform.data(), sizeof(double) * 16);
+        std::memcpy(record + offsetof(SceneNode, layer_color_rgba), &n.layer_color_rgba, sizeof(n.layer_color_rgba));
+        std::memcpy(record + offsetof(SceneNode, node_flags), &n.node_flags, sizeof(n.node_flags));
+        append_bytes(record, sizeof(record));
     }
 
     for (const auto& g : geometries_) {

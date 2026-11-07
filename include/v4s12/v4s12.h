@@ -59,12 +59,17 @@ struct Header {
 };
 #pragma pack(pop)
 
+static_assert(sizeof(Header) == 80, "Header must be 80 bytes with no padding");
+
+/* On disk a SceneNode occupies 144 bytes: geometry_id (4), 4 zero bytes,
+ * transform (16 doubles), layer_color_rgba (4), node_flags (4). */
 struct SceneNode {
     uint32_t geometry_id;
     std::array<double, 16> transform; 
     uint32_t layer_color_rgba;
     uint32_t node_flags;
 };
+static_assert(sizeof(SceneNode) == 144, "SceneNode must be 144 bytes");
 
 class Encoder {
 public:
