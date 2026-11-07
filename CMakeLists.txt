@@ -51,6 +51,15 @@ else()
     set(ZSTD_INCLUDE_DIRS ${zstd_SOURCE_DIR}/lib)
 endif()
 
+# Compiler warnings for this project's own targets
+function(v4s12_enable_warnings target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra)
+    endif()
+endfunction()
+
 # Core library (hash from the HASH-G3-RH512-256 submodule)
 add_library(v4s12_lib STATIC
     src/encoder.cpp
@@ -59,6 +68,8 @@ add_library(v4s12_lib STATIC
     src/v4s12_c_api.cpp
     external/HASH-G3-RH512-256/src/g3_hash.c
 )
+
+v4s12_enable_warnings(v4s12_lib)
 
 target_include_directories(v4s12_lib PUBLIC 
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -74,8 +85,11 @@ endif()
 
 # 2. Build Native Tools (Only if NOT building with Emscripten)
 if(NOT EMSCRIPTEN)
-    add_executable(test_v2 test/test_v2.cpp)
-    target_link_libraries(test_v2 PRIVATE v4s12_lib)
+    enable_testing()
+    add_executable(test_format test/test_format.cpp)
+    target_link_libraries(test_format PRIVATE v4s12_lib)
+    v4s12_enable_warnings(test_format)
+    add_test(NAME v4s_format_test COMMAND test_format)
 
     add_executable(v4s_info cli/v4s_info.cpp)
     target_link_libraries(v4s_info PRIVATE v4s12_lib)
