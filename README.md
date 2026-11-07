@@ -1,202 +1,182 @@
-# v4s Format Specification & V4S12-MATHEMATICAL-CORE (v1.0)
-*Deterministic Vector Data Architecture, V4 Spectral Transform & $S_{12}$ Lattice Engine*
+# v4s — compact container for deduplicated 3D triangle meshes
 
-**Lead Author:** Antonio García Leal  
-**Core / Specification License:** Dual License (GPLv3 / Commercial License)  
-**Language Standard:** C99 (External Mathematical Core & Hash) / C++17 (Core Engine, Pipeline & Containers)
+[![CI](https://github.com/garcialeal/V4S-FORMAT/actions/workflows/ci.yml/badge.svg)](https://github.com/garcialeal/V4S-FORMAT/actions/workflows/ci.yml)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
----
+`.v4s` is a binary container for scenes made of many instances of a smaller
+set of triangle meshes, as found in CAD and BIM assemblies. Each unique mesh
+is stored once; scene nodes reference it with a 4x4 transform and a color.
 
-## 1. Overview
+- **Deduplication:** identical meshes (same vertices, same triangles) are
+  stored once. Identity is the [RH512](https://github.com/garcialeal/HASH-G3-RH512-256)
+  hash (validated in SMHasher3), confirmed by exact byte comparison.
+- **Bounded lossy compression:** positions are quantized uniformly over each
+  mesh's bounding box (1 to 16 bits per coordinate, default 16) and the
+  payload is compressed with ZSTD. Maximum error per axis:
+  `extent / (2 * (2^bits - 1))`.
+- **Deterministic output:** the same scene always produces the same bytes.
+- **Validated decoding:** every size and offset is checked; corrupted or
+  truncated files are rejected, never read out of bounds.
 
-**v4s v1.0** is a high-performance binary format and deterministic geometric processing engine engineered to eliminate IEEE 754 floating-point bottlenecks, topological drift, and memory redundancy in massive 3D CAD, GIS, and BIM datasets.
-
-By combining the **V4 Butterfly Spectral Transform**, **$S_{12}$ Coprime Residue Lattice Quantization**, and the **G3-RH512-256 Spatial Hashing Algorithm**, **v4s** executes core geometric transformations via bitwise integer combinatorics (**0 FLOPs**). This delivers $O(1)$ instanced deduplication, strict bounded quantization error, and direct Zero-Copy memory mapping for WebGPU, WebAssembly, and native CAD engines.
-
----
-
-## 2. Modular Architecture & Project Structure
-
-The project decouples low-level mathematical primitives into submodules located in `external/`, maintaining a clean separation between high-level container handling and the core algebra.
-
-    v4s-format/
-    ├── external/                            # Core submodules (C99)
-    │   ├── HASH-G3-RH512-256/              # G3-RH512-256 spatial hashing algorithm
-    │   └── V4S12-MATHEMATICAL-CORE/        # S12 quantization, V4 transform & zigzag
-    ├── include/v4s12/                      # Public V4S12-MATHEMATICAL-CORE headers (C++17 / C API)
-    │   ├── types.h                         # Container structures and binary types
-    │   ├── v4s12.h                         # High-level container API
-    │   ├── v4s12_c_api.h                   # Interoperability C-API (WASM / C# / Python)
-    │   ├── mesh_optimizer.h                # Topological reordering algorithms
-    │   └── spectral_pipeline.h             # Spectral transform pipeline orchestration
-    ├── src/                                # Engine implementation
-    │   ├── encoder.cpp / decoder.cpp       # .v4s binary serializer/deserializer
-    │   ├── mesh_optimizer.cpp              # Vertex cache & topological optimization
-    │   ├── spectral_pipeline.cpp           # Quantization & transform pipeline wrappers
-    │   ├── v4s12_c_api.cpp                 # C-API wrapper implementation
-    │   └── wasm_export.cpp                 # WebAssembly Emscripten entry points
-    ├── cli/                                # Command line tools (v4s_info)
-    ├── tools/                              # Benchmark generators (generate_benchmarks)
-    └── test/                               # Verification suite (test_v2)
+Current format version: **3.0** (header `version = 300`). Files written by
+earlier versions (v1.0 release, header 200) cannot be decoded.
 
 ---
 
-## 3. Processing Pipeline & Technical Features
+## Measured results
 
-The **v4s** pipeline executes a 5-stage processing sequence:
+`tools/generate_benchmarks` (Linux x86_64, ZSTD level 3, 16 bits):
 
-    [Float32 / Double CAD Geometry]
-                   │
-                   ▼
-     [1. G3 Spatial Hashing] ──────────> O(1) Instanced deduplication
-                   │
-                   ▼
-     [2. S12 Lattice Quantization] ────> Bounded C1 continuous coordinate discretization
-                   │
-                   ▼
-     [3. V4 Spectral Transform] ───────> Integer bitwise combinatorics (0 FLOPs)
-                   │
-                   ▼
-     [4. Entropic Reordering] ─────────> Energy grouping via Klein orbits & Zigzag
-                   │
-                   ▼
-     [5. v4s Binary Packing] ──────────> Memory-aligned ZSTD stream serialization
+| Dataset | Content | Raw size | `.v4s` size |
+| :--- | :--- | ---: | ---: |
+| `dense_sphere_180k` | 1 mesh: 89,110 vertices, 178,802 triangles | 3,214,944 B (float32 + uint32) | 1,211,155 B (37.7 %) |
+| `cad_instanced_10k` | 1 cube mesh, 10,000 nodes | — | 1,440,284 B |
 
-### 3.1 G3 Spatial Hashing Engine
-* **Non-Cryptographic Fast Hashing:** Powered by `g3-rh512-256` in pure C99 for instant $O(1)$ mesh hash generation.
-* **Structural Instancing:** Detects duplicate meshes before geometry processing, eliminating storage overhead in massive CAD assemblies.
+Round trip on `dense_sphere_180k`: maximum error 1.53e-5 and RMS error
+8.6e-6 for a sphere of radius 1 (the maximum equals the theoretical bound).
 
-### 3.2 $S_{12}$ Lattice Quantization
-* **Strict Error Bounding:** Replaces float32 representations with discrete lattice coordinates, guaranteeing $C^1$ tangential continuity along shared boundaries.
-* **Verified Precision:** Reversibility tests confirm a maximum quantization error bounded at $\Delta_{max} \approx 0.0004884$ units (sub-millimeter accuracy for CAD/GIS applications).
-
-### 3.3 V4 Butterfly Spectral Transform (0 FLOPs)
-* **Integer Combinatorics:** Eliminates floating-point matrix multiplication in favor of shift-and-add register-level operations (`>>`).
-* **Cross-Platform Determinism:** Prevents rendering discrepancies across heterogeneous web/mobile clients by avoiding IEEE 754 rounding differences.
+Notes:
+- Most of the compressed size of a dense mesh is the index buffer
+  (32-bit indices); positions are the smaller part.
+- Scene nodes are stored uncompressed (144 bytes each), so a scene with many
+  instances is dominated by the node table.
 
 ---
 
-## 4. Empirical Benchmarks & Empirical Validation
+## Encoding pipeline
 
-The pipeline performance has been evaluated on dense meshes and instanced CAD assemblies.
+    float32 positions + uint32 triangle indices
+        │
+        ├─ 1. Validation       sizes multiple of 3, finite values, indices in range
+        ├─ 2. Deduplication    RH512 hash -> hash table -> exact byte comparison
+        ├─ 3. Vertex welding   vertices whose coordinates round to the same
+        │                      multiple of 1e-5 are merged; unused vertices dropped
+        ├─ 4. Quantization     q = round((x - min) / extent * (2^bits - 1))
+        └─ 5. ZSTD             quantized positions (uint16) + indices (uint32)
 
-### 4.1 Benchmark Metrics Summary
-
-| Dataset / Benchmark File | Input Description | Raw Memory Size | `.v4s` Compressed Size | Efficiency / Reduction |
-| :--- | :--- | :--- | :--- | :--- |
-| **`dense_sphere_180k.v4s`** | 89,110 vertices, 536,406 indices (180k triangles) | ~3.22 MB | **1.3 MB** | **~60% Reduction** (~14.5 B/vertex incl. topology) |
-| **`cad_instanced_10k.v4s`** | 10,000 scene nodes / instances (1 base mesh) | ~3.20 MB | **1.4 MB** | **~140 Bytes/Node** (High-density instancing) |
-
-### 4.2 Reversibility & Round-Trip Validation (`test_v2`)
-* **Pipeline Integrity:** Tested via `./build/test_v2` over full `S12 -> V4 -> ZSTD -> De-ZSTD -> Inv-V4 -> De-S12` round-trip.
-* **Reconstruction Accuracy:**
-  * Original Coordinate: `X = 1.000000`
-  * Restored Coordinate: `X = 0.999512`
-  * Maximum Observed Error ($\Delta$): `0.0004884` units.
-* **Verification Status:** `SUCCESS` (Topological reversibility and bounded precision fully validated).
+Vertex welding uses an absolute tolerance of 1e-5 model units and renumbers
+vertices in order of first use. The decoded mesh has the same triangles,
+possibly with fewer and reordered vertices. Normals passed to the encoder
+are currently ignored (not stored).
 
 ---
 
-## 5. Binary Format Specification (.v4s v1.0)
+## File format 3.0
 
-A **.v4s** file consists of three memory-aligned contiguous blocks:
+All values are little-endian. The format targets little-endian hosts
+(x86, ARM, WebAssembly); big-endian hosts are not supported.
 
-    +-------------------------------------------------------+
-    | Header (64 bytes, 8-byte aligned)                     |
-    +-------------------------------------------------------+
-    | Scene Nodes Table (num_nodes * sizeof(SceneNode))     |
-    +-------------------------------------------------------+
-    | Geometry Blocks (Hash + AABB + ZSTD Payload Stream)   |
-    +-------------------------------------------------------+
+    +--------------------------------------------------+
+    | Header (80 bytes)                                |
+    +--------------------------------------------------+
+    | Scene nodes (num_nodes x 144 bytes)              |
+    +--------------------------------------------------+
+    | Geometry records (num_geometries, variable size) |
+    +--------------------------------------------------+
 
-### 5.1 Header Structure (`Header`)
+### Header (80 bytes)
 
-| Field | Type | Size | Description |
-| :--- | :--- | :--- | :--- |
-| `magic` | `char[4]` | 4 bytes | Identifies format (`'V'`, `'4'`, `'S'`, `'2'`) |
-| `version` | `uint16_t` | 2 bytes | Standard version (`100` = v1.0) |
-| `flags` | `uint16_t` | 2 bytes | Global format bitmask |
-| `global_aabb_min` | `double[3]` | 24 bytes | Minimum bounding box ($X, Y, Z$) |
-| `global_aabb_max` | `double[3]` | 24 bytes | Maximum bounding box ($X, Y, Z$) |
-| `num_geometries` | `uint32_t` | 4 bytes | Count of unique deduplicated geometry blocks |
-| `num_nodes` | `uint32_t` | 4 bytes | Count of scene instances / node transformations |
-| `offset_hashtable`| `uint64_t` | 8 bytes | Byte offset to scene nodes block |
-| `offset_geometries`| `uint64_t`| 8 bytes | Byte offset to payload stream |
+| Offset | Field | Type | Description |
+| ---: | :--- | :--- | :--- |
+| 0 | `magic` | `char[4]` | `'V' '4' 'S' '2'` |
+| 4 | `version` | `uint16` | `300` |
+| 6 | `flags` | `uint16` | `0x0006` (ZSTD payload, per-node colors) |
+| 8 | `global_aabb_min` | `double[3]` | Reserved, currently written as zero |
+| 32 | `global_aabb_max` | `double[3]` | Reserved, currently written as zero |
+| 56 | `num_geometries` | `uint32` | Number of geometry records |
+| 60 | `num_nodes` | `uint32` | Number of scene nodes |
+| 64 | `offset_hashtable` | `uint64` | Byte offset of the scene node table |
+| 72 | `offset_geometries` | `uint64` | Byte offset of the first geometry record |
 
-### 5.2 Format Bitmask Flags (`FormatFlags`)
-* `FLAG_NONE` (`0x0000`): Base configuration.
-* `FLAG_HAS_NORMALS` (`0x0001`): Encoded normal attributes.
-* `FLAG_LAYER_COLORS` (`0x0002`): Per-entity packed 32-bit RGBA colors.
-* `FLAG_ZSTD_COMPRESSED` (`0x0004`): Payload compressed via ZSTD algorithm.
-* `FLAG_INDEX_16BIT` (`0x0008`): 16-bit index buffers for optimized small geometries.
+### Scene node (144 bytes)
 
----
+| Offset | Field | Type |
+| ---: | :--- | :--- |
+| 0 | `geometry_id` | `uint32` (index of a geometry record) |
+| 4 | padding | 4 zero bytes |
+| 8 | `transform` | `double[16]` (the tools in this repository use column-major order, translation in elements 12–14) |
+| 136 | `layer_color_rgba` | `uint32` |
+| 140 | `node_flags` | `uint32` |
 
-## 6. Native C-API (`v4s12_c_api.h`)
+### Geometry record (96 bytes + payload)
 
-An opaque pointer interface (`v4s12_decoder_t`) exposes the decoder to WebAssembly, C#, Python, Rust, and ObjectARX/C++ plugins:
+| Offset | Field | Type | Description |
+| ---: | :--- | :--- | :--- |
+| 0 | `hash` | `uint8[32]` | RH512 of the encoder input: `[bits][float count][index count][vertex bytes][index bytes]` |
+| 32 | `local_aabb_min` | `double[3]` | Bounding box of the welded vertices |
+| 56 | `local_aabb_max` | `double[3]` | |
+| 80 | `vertex_count` | `uint32` | Vertices after welding |
+| 84 | `index_count` | `uint32` | Multiple of 3 |
+| 88 | `quantization_bits` | `uint32` | 1 to 16 |
+| 92 | `payload_size` | `uint32` | Bytes of the ZSTD frame that follows |
+| 96 | payload | ZSTD frame | Decompresses to `vertex_count * 3` `uint16` (x, y, z interleaved) followed by `index_count` `uint32` |
 
-    #include "v4s12/v4s12_c_api.h"
-
-    // Lifecycle management
-    v4s12_decoder_t* v4s12_decoder_create(void);
-    void v4s12_decoder_destroy(v4s12_decoder_t* decoder);
-
-    // Zero-copy memory decoding
-    int v4s12_decoder_load_memory(v4s12_decoder_t* decoder, const char* buffer, size_t size);
-
-    // Scene inspection
-    uint32_t v4s12_decoder_get_geometry_count(const v4s12_decoder_t* decoder);
-    uint32_t v4s12_decoder_get_node_count(const v4s12_decoder_t* decoder);
-
-    // Geometry extraction
-    int v4s12_decoder_get_geometry_info(const v4s12_decoder_t* decoder, uint32_t index, 
-                                       uint32_t* out_vertex_count, uint32_t* out_index_count);
-    int v4s12_decoder_read_geometry(const v4s12_decoder_t* decoder, uint32_t index,
-                                    float* out_vertices, uint32_t* out_indices);
-
-    // Instance transform extraction
-    int v4s12_decoder_read_node(const v4s12_decoder_t* decoder, uint32_t index,
-                                uint32_t* out_geom_id, double out_transform[16], uint32_t* out_color);
+Dequantization: `x = min + q / (2^bits - 1) * (max - min)`.
 
 ---
 
-## 7. Building, Testing & Compilation
+## API
 
-**CMake 3.15+** is used for cross-platform builds.
+C++ (`include/v4s12/v4s12.h`):
 
-### 7.1 Clone with Submodules
-Ensure submodules in `external/` are fetched upon cloning:
+    v4s12::Encoder enc;
+    enc.set_quantization_bits(16);                     // optional, 1..16
+    uint32_t id = enc.add_geometry(vertices, {}, indices);
+    if (id == v4s12::Encoder::INVALID_ID) { /* invalid input */ }
+    enc.add_node(id, transform);                       // returns false on unknown id
+    enc.write_file("scene.v4s");
+
+    v4s12::Decoder dec;
+    if (dec.read_file("scene.v4s")) {
+        const auto& geometries = dec.get_geometries(); // vertices, indices
+        const auto& nodes = dec.get_nodes();
+    }
+
+A C API for WebAssembly, C#, Python and other bindings is in
+`include/v4s12/v4s12_c_api.h`.
+
+---
+
+## Building and testing
+
+Requirements: CMake 3.15+, a C99 and C++17 compiler, libzstd and pkg-config.
 
     git clone --recursive https://github.com/garcialeal/V4S-FORMAT.git
-    # Or inside an existing workspace:
-    git submodule update --init --recursive
-
-### 7.2 Native Build & Testing
-
-    # Configure and build static library and tools
-    cmake -B build
+    cd V4S-FORMAT
+    cmake -B build -DCMAKE_BUILD_TYPE=Release
     cmake --build build
+    ctest --test-dir build --output-on-failure
 
-    # Run unit tests (Precision and reversibility validation)
-    ./build/test_v2
+Tools:
 
-    # Run benchmarks (Generates dense sphere and CAD instanced benchmarks)
-    ./build/generate_benchmarks
-
-    # Inspect generated binary file metadata
+    ./build/generate_benchmarks          # writes benchmarks/*.v4s
     ./build/v4s_info benchmarks/dense_sphere_180k.v4s
 
-### 7.3 WebAssembly Compilation (Emscripten)
-Generates `v4s12_decoder.js` and `v4s12_decoder.wasm` for WebGL/WebGPU web rendering contexts:
+The test suite checks the error bound at 16, 12 and 8 bits, deduplication,
+byte-identical output, input validation, and that every truncated file and
+2,000 randomly corrupted files are handled without crashing. CI runs it on
+Linux (GCC, Clang), macOS, and with AddressSanitizer and
+UndefinedBehaviorSanitizer.
 
-    mkdir build-wasm && cd build-wasm
-    emcmake cmake ..
-    emmake make
+Not covered by CI: Windows (the build finds zstd through pkg-config) and the
+WebAssembly targets (`emcmake cmake`), which build `v4s12_decoder.js` and
+`v4s12_encoder.js`.
 
 ---
 
-## 8. Licensing Model
+## Changes from v1.0
 
-* **API Specification & Open V4S12-MATHEMATICAL-CORE (GPLv3):** Free for open-source tools, academic research, and public inspection.
-* **Commercial V4S12-MATHEMATICAL-CORE License:** Proprietary license for commercial CAD/GIS plugins, enterprise pipelines, and embedded engines without GPLv3 copyleft obligations.
+Format 3.0 replaces the S12 lattice quantization and the V4 butterfly
+transform used in v1.0. Measurements showed that the V4 transform roughly
+tripled the compressed size of the vertex data and that S12 behaved like a
+10-bit quantizer that compressed worse than a uniform one. Uniform 16-bit
+quantization gives smaller files and an error about 80 times lower. It also
+fixes deduplication (v1.0 ignored the triangles), non-deterministic node
+padding and the lack of validation in the decoder.
+
+---
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE). For licensing under other terms,
+contact the author.
