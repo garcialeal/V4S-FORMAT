@@ -33,6 +33,29 @@
 
 namespace v4s12 {
 
+namespace {
+
+// Exact identity of a geometry as given to add_geometry:
+// [quantization bits][vertex float count][index count][vertex bytes][index bytes]
+std::vector<uint8_t> geometry_key(const std::vector<float>& vertices,
+                                  const std::vector<uint32_t>& indices,
+                                  uint32_t bits) {
+    const uint32_t header[3] = {
+        bits,
+        static_cast<uint32_t>(vertices.size()),
+        static_cast<uint32_t>(indices.size())
+    };
+    std::vector<uint8_t> key(sizeof(header) + vertices.size() * sizeof(float) +
+                             indices.size() * sizeof(uint32_t));
+    uint8_t* p = key.data();
+    std::memcpy(p, header, sizeof(header));                       p += sizeof(header);
+    std::memcpy(p, vertices.data(), vertices.size() * sizeof(float)); p += vertices.size() * sizeof(float);
+    std::memcpy(p, indices.data(), indices.size() * sizeof(uint32_t));
+    return key;
+}
+
+} // namespace
+
 void Encoder::calculate_aabb(const std::vector<float>& vertices, double min[3], double max[3]) {
     for (int i = 0; i < 3; ++i) {
         min[i] = std::numeric_limits<double>::max();
@@ -52,10 +75,15 @@ uint32_t Encoder::add_geometry(const std::vector<float>& vertices,
                                const std::vector<float>& normals,
                                const std::vector<uint32_t>& indices) {
                                
-    // 1. Deduplication via G3-RH512-256
-    Hash256 current_hash = compute_g3_hash(vertices.data(), vertices.size() * sizeof(float));
-    for (size_t i = 0; i < geometries_.size(); ++i) {
-        if (geometries_[i].hash == current_hash) return static_cast<uint32_t>(i);
+    // 1. Deduplication: RH512 hash of vertices + indices + quantization bits,
+    //    looked up in a hash table and confirmed by exact byte comparison.
+    std::vector<uint8_t> key = geometry_key(vertices, indices, quantization_bits_);
+    const Hash256 current_hash = compute_g3_hash(key.data(), key.size());
+    auto found = dedup_index_.find(current_hash);
+    if (found != dedup_index_.end()) {
+        for (uint32_t id : found->second) {
+            if (dedup_keys_[id] == key) return id;
+        }
     }
 
     GeometryData geom;
@@ -99,8 +127,11 @@ uint32_t Encoder::add_geometry(const std::vector<float>& vertices,
                                   raw_payload.data(), raw_payload.size(), 3);
     geom.compressed_payload.resize(c_size);
 
+    const uint32_t id = static_cast<uint32_t>(geometries_.size());
     geometries_.push_back(std::move(geom));
-    return static_cast<uint32_t>(geometries_.size() - 1);
+    dedup_index_[current_hash].push_back(id);
+    dedup_keys_.push_back(std::move(key));
+    return id;
 }
 
 void Encoder::set_quantization_bits(uint32_t bits) {

@@ -34,6 +34,8 @@
 #include <vector>
 #include <string>
 #include <array>
+#include <cstring>
+#include <unordered_map>
 
 #include "v4s12/types.h"
 #include "g3_hash.h"
@@ -90,6 +92,19 @@ private:
     std::vector<GeometryData> geometries_;
     std::vector<SceneNode> nodes_;
     uint32_t quantization_bits_ = 16;
+
+    /* Deduplication index: hash -> ids of geometries with that hash.
+     * dedup_keys_[id] keeps the exact input bytes of each unique geometry,
+     * so that a hash match is confirmed byte by byte (no false merges). */
+    struct Hash256Hasher {
+        size_t operator()(const Hash256& h) const {
+            size_t v;
+            std::memcpy(&v, h.data(), sizeof(v));
+            return v;
+        }
+    };
+    std::unordered_map<Hash256, std::vector<uint32_t>, Hash256Hasher> dedup_index_;
+    std::vector<std::vector<uint8_t>> dedup_keys_;
 
     void calculate_aabb(const std::vector<float>& vertices, double min[3], double max[3]);
 };
