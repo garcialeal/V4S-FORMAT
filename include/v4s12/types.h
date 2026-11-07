@@ -27,15 +27,6 @@
 #include <array>
 #include <vector>
 
-#ifndef V4S12_INT_T_DEFINED
-#define V4S12_INT_T_DEFINED
-#ifdef V4S12_HIGH_PRECISION
-    typedef int64_t v4s12_int_t;
-#else
-    typedef int32_t v4s12_int_t;
-#endif
-#endif
-
 namespace v4s12 {
 
 enum PrimitiveTopology : uint16_t {
@@ -73,10 +64,6 @@ enum StatusCode : int32_t {
     ERR_ZSTD_DECODE_FAIL    = -5
 };
 
-struct SpectralBlock {
-    v4s12_int_t data[16]; 
-};
-
 struct MeshCluster {
     uint32_t vertex_offset;
     uint32_t index_offset;
@@ -91,6 +78,7 @@ struct GeometryData {
     double local_aabb_max[3];
     uint32_t original_vertex_count;
     uint32_t original_index_count;
+    uint32_t quantization_bits = 0;
     std::vector<uint8_t> compressed_payload;
     
     std::vector<float> vertices;

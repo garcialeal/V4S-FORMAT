@@ -30,14 +30,32 @@
 #include <cstring>
 #include <limits>
 #include <cmath>
-
-extern "C" {
-#include "s12_quant.h"
-#include "v4_transform.h"
-#include "v4_zigzag.h"
-}
+#include <cstddef>
 
 namespace v4s12 {
+
+namespace {
+
+// Exact identity of a geometry as given to add_geometry:
+// [quantization bits][vertex float count][index count][vertex bytes][index bytes]
+std::vector<uint8_t> geometry_key(const std::vector<float>& vertices,
+                                  const std::vector<uint32_t>& indices,
+                                  uint32_t bits) {
+    const uint32_t header[3] = {
+        bits,
+        static_cast<uint32_t>(vertices.size()),
+        static_cast<uint32_t>(indices.size())
+    };
+    std::vector<uint8_t> key(sizeof(header) + vertices.size() * sizeof(float) +
+                             indices.size() * sizeof(uint32_t));
+    uint8_t* p = key.data();
+    std::memcpy(p, header, sizeof(header));                       p += sizeof(header);
+    std::memcpy(p, vertices.data(), vertices.size() * sizeof(float)); p += vertices.size() * sizeof(float);
+    std::memcpy(p, indices.data(), indices.size() * sizeof(uint32_t));
+    return key;
+}
+
+} // namespace
 
 void Encoder::calculate_aabb(const std::vector<float>& vertices, double min[3], double max[3]) {
     for (int i = 0; i < 3; ++i) {
@@ -58,10 +76,30 @@ uint32_t Encoder::add_geometry(const std::vector<float>& vertices,
                                const std::vector<float>& normals,
                                const std::vector<uint32_t>& indices) {
                                
-    // 1. Deduplication via G3-RH512-256
-    Hash256 current_hash = compute_g3_hash(vertices.data(), vertices.size() * sizeof(float));
-    for (size_t i = 0; i < geometries_.size(); ++i) {
-        if (geometries_[i].hash == current_hash) return static_cast<uint32_t>(i);
+    (void)normals;  // normals are not stored in format 3.0
+
+    // 0. Input validation: triangles only, finite coordinates, valid indices
+    if (vertices.empty() || vertices.size() % 3 != 0) return INVALID_ID;
+    if (indices.empty() || indices.size() % 3 != 0) return INVALID_ID;
+    if (vertices.size() / 3 > std::numeric_limits<uint32_t>::max() ||
+        indices.size() > std::numeric_limits<uint32_t>::max()) return INVALID_ID;
+    for (float x : vertices) {
+        if (!std::isfinite(x)) return INVALID_ID;
+    }
+    const size_t vertex_count = vertices.size() / 3;
+    for (uint32_t index : indices) {
+        if (index >= vertex_count) return INVALID_ID;
+    }
+
+    // 1. Deduplication: RH512 hash of vertices + indices + quantization bits,
+    //    looked up in a hash table and confirmed by exact byte comparison.
+    std::vector<uint8_t> key = geometry_key(vertices, indices, quantization_bits_);
+    const Hash256 current_hash = compute_g3_hash(key.data(), key.size());
+    auto found = dedup_index_.find(current_hash);
+    if (found != dedup_index_.end()) {
+        for (uint32_t id : found->second) {
+            if (dedup_keys_[id] == key) return id;
+        }
     }
 
     GeometryData geom;
@@ -78,72 +116,55 @@ uint32_t Encoder::add_geometry(const std::vector<float>& vertices,
     // 3. Local Axis-Aligned Bounding Box (AABB) extraction over optimized geometry
     calculate_aabb(opt_vertices, geom.local_aabb_min, geom.local_aabb_max);
 
-    // 4. S12 Quantization and Block Preparation
-    std::vector<v4s12_int_t> quantized_data;
-    quantized_data.reserve(opt_vertices.size());
-    
-    double range[3] = {
-        std::max(geom.local_aabb_max[0] - geom.local_aabb_min[0], 1e-5),
-        std::max(geom.local_aabb_max[1] - geom.local_aabb_min[1], 1e-5),
-        std::max(geom.local_aabb_max[2] - geom.local_aabb_min[2], 1e-5)
-    };
-
-    for (size_t i = 0; i < opt_vertices.size(); i += 3) {
-        for (int j = 0; j < 3; ++j) {
-            // Normalization to [0, 4095] space (12-bit)
-            double normalized = (opt_vertices[i+j] - geom.local_aabb_min[j]) / range[j];
-            v4s12_int_t coord = static_cast<v4s12_int_t>(std::round(normalized * 4095.0));
-            // Projection onto S12 residual grid
-            quantized_data.push_back(s12_quantize_spline(coord));
-        }
+    // 4. Uniform quantization of positions over the local AABB
+    //    q = round((x - min) / extent * (2^bits - 1)), stored as uint16
+    const uint32_t bits = quantization_bits_;
+    const double levels = static_cast<double>((1u << bits) - 1u);
+    std::vector<uint16_t> quantized(opt_vertices.size());
+    for (size_t i = 0; i < opt_vertices.size(); ++i) {
+        const size_t axis = i % 3;
+        const double extent = geom.local_aabb_max[axis] - geom.local_aabb_min[axis];
+        const double t = extent > 0.0 ? (opt_vertices[i] - geom.local_aabb_min[axis]) / extent : 0.0;
+        quantized[i] = static_cast<uint16_t>(std::lround(t * levels));
     }
+    geom.quantization_bits = bits;
 
-    // Padding to ensure multiples of 16 (required by v4_transform_2d_4x4)
-    while (quantized_data.size() % 16 != 0) {
-        quantized_data.push_back(0); 
-    }
-
-    // 5. V4 Butterfly Transform and ZigZag Reordering
-    std::vector<v4s12_int_t> spectral_payload(quantized_data.size());
-    for (size_t i = 0; i < quantized_data.size(); i += 16) {
-        v4s12_int_t block[16];
-        std::memcpy(block, &quantized_data[i], 16 * sizeof(v4s12_int_t));
-        
-        v4_transform_2d_4x4(block);
-        
-        v4s12_int_t zigzag_block[16];
-        v4_zigzag_reorder(block, zigzag_block);
-        
-        std::memcpy(&spectral_payload[i], zigzag_block, 16 * sizeof(v4s12_int_t));
-    }
-
-    // 6. Binary Payload Assembly
+    // 5. Binary payload: quantized positions followed by 32-bit indices
     std::vector<uint8_t> raw_payload;
-    size_t payload_bytes = spectral_payload.size() * sizeof(v4s12_int_t) + opt_indices.size() * sizeof(uint32_t);
-    raw_payload.resize(payload_bytes);
-    
-    size_t spectral_bytes = spectral_payload.size() * sizeof(v4s12_int_t);
-    std::memcpy(raw_payload.data(), spectral_payload.data(), spectral_bytes);
-    std::memcpy(raw_payload.data() + spectral_bytes, opt_indices.data(), opt_indices.size() * sizeof(uint32_t));
+    const size_t position_bytes = quantized.size() * sizeof(uint16_t);
+    raw_payload.resize(position_bytes + opt_indices.size() * sizeof(uint32_t));
+    std::memcpy(raw_payload.data(), quantized.data(), position_bytes);
+    std::memcpy(raw_payload.data() + position_bytes, opt_indices.data(), opt_indices.size() * sizeof(uint32_t));
 
-    // 7. ZSTD Entropic Compression
+    // 6. ZSTD compression
     size_t max_compressed = ZSTD_compressBound(raw_payload.size());
     geom.compressed_payload.resize(max_compressed);
     size_t c_size = ZSTD_compress(geom.compressed_payload.data(), max_compressed,
                                   raw_payload.data(), raw_payload.size(), 3);
     geom.compressed_payload.resize(c_size);
 
+    const uint32_t id = static_cast<uint32_t>(geometries_.size());
     geometries_.push_back(std::move(geom));
-    return static_cast<uint32_t>(geometries_.size() - 1);
+    dedup_index_[current_hash].push_back(id);
+    dedup_keys_.push_back(std::move(key));
+    return id;
 }
 
-void Encoder::add_node(uint32_t geometry_id, const double transform[16], uint32_t layer_color_rgba, uint32_t node_flags) {
+void Encoder::set_quantization_bits(uint32_t bits) {
+    if (bits < 1) bits = 1;
+    if (bits > 16) bits = 16;
+    quantization_bits_ = bits;
+}
+
+bool Encoder::add_node(uint32_t geometry_id, const double transform[16], uint32_t layer_color_rgba, uint32_t node_flags) {
+    if (transform == nullptr || geometry_id >= geometries_.size()) return false;
     SceneNode node;
     node.geometry_id = geometry_id;
     std::copy(transform, transform + 16, node.transform.begin());
     node.layer_color_rgba = layer_color_rgba;
     node.node_flags = node_flags;
     nodes_.push_back(node);
+    return true;
 }
 
 bool Encoder::write_memory(std::vector<uint8_t>& out_buffer) const {
@@ -157,7 +178,7 @@ bool Encoder::write_memory(std::vector<uint8_t>& out_buffer) const {
 
     size_t total_size = sizeof(Header) + (nodes_.size() * sizeof(SceneNode));
     for (const auto& g : geometries_) {
-        total_size += 32 + (3 * sizeof(double)) * 2 + (sizeof(uint32_t) * 3) + g.compressed_payload.size();
+        total_size += 32 + (3 * sizeof(double)) * 2 + (sizeof(uint32_t) * 4) + g.compressed_payload.size();
     }
 
     out_buffer.clear();
@@ -169,8 +190,16 @@ bool Encoder::write_memory(std::vector<uint8_t>& out_buffer) const {
     };
 
     append_bytes(&hdr, sizeof(Header));
-    if (!nodes_.empty()) {
-        append_bytes(nodes_.data(), nodes_.size() * sizeof(SceneNode));
+
+    // Nodes are serialized field by field so that the 4 padding bytes after
+    // geometry_id are always zero: identical scenes give identical files.
+    for (const auto& n : nodes_) {
+        uint8_t record[sizeof(SceneNode)] = {0};
+        std::memcpy(record + offsetof(SceneNode, geometry_id), &n.geometry_id, sizeof(n.geometry_id));
+        std::memcpy(record + offsetof(SceneNode, transform), n.transform.data(), sizeof(double) * 16);
+        std::memcpy(record + offsetof(SceneNode, layer_color_rgba), &n.layer_color_rgba, sizeof(n.layer_color_rgba));
+        std::memcpy(record + offsetof(SceneNode, node_flags), &n.node_flags, sizeof(n.node_flags));
+        append_bytes(record, sizeof(record));
     }
 
     for (const auto& g : geometries_) {
@@ -179,6 +208,7 @@ bool Encoder::write_memory(std::vector<uint8_t>& out_buffer) const {
         append_bytes(g.local_aabb_max, 3 * sizeof(double));
         append_bytes(&g.original_vertex_count, sizeof(uint32_t));
         append_bytes(&g.original_index_count, sizeof(uint32_t));
+        append_bytes(&g.quantization_bits, sizeof(uint32_t));
         
         uint32_t payload_size = static_cast<uint32_t>(g.compressed_payload.size());
         append_bytes(&payload_size, sizeof(uint32_t));

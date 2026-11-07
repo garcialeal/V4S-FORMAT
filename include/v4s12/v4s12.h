@@ -26,24 +26,7 @@
 #include <stddef.h>
 
 /* ========================================================================= */
-/* 1. C99 MATHEMATICAL CORE                                                 */
-/* ========================================================================= */
-
-#ifndef V4S12_INT_T_DEFINED
-#define V4S12_INT_T_DEFINED
-#ifdef V4S12_HIGH_PRECISION
-    typedef int64_t v4s12_int_t;
-#else
-    typedef int32_t v4s12_int_t;
-#endif
-#endif
-
-#include "v4s12/v4_transform.h"
-#include "v4s12/v4_zigzag.h"
-#include "v4s12/s12_quant.h"
-
-/* ========================================================================= */
-/* 2. .V4S CONTAINER AND SCENE LAYER (C++17)                                 */
+/* .V4S CONTAINER AND SCENE LAYER (C++17)                                    */
 /* ========================================================================= */
 
 #ifdef __cplusplus
@@ -51,6 +34,8 @@
 #include <vector>
 #include <string>
 #include <array>
+#include <cstring>
+#include <unordered_map>
 
 #include "v4s12/types.h"
 #include "g3_hash.h"
@@ -60,7 +45,7 @@ namespace v4s12 {
 #pragma pack(push, 8)
 struct Header {
     char magic[4] = {'V', '4', 'S', '2'};
-    uint16_t version = 200;
+    uint16_t version = 300;  /* format 3.0: uniform quantization */
     uint16_t flags = 0;
     
     double global_aabb_min[3] = {0.0, 0.0, 0.0};
@@ -74,25 +59,43 @@ struct Header {
 };
 #pragma pack(pop)
 
+static_assert(sizeof(Header) == 80, "Header must be 80 bytes with no padding");
+
+/* On disk a SceneNode occupies 144 bytes: geometry_id (4), 4 zero bytes,
+ * transform (16 doubles), layer_color_rgba (4), node_flags (4). */
 struct SceneNode {
     uint32_t geometry_id;
     std::array<double, 16> transform; 
     uint32_t layer_color_rgba;
     uint32_t node_flags;
 };
+static_assert(sizeof(SceneNode) == 144, "SceneNode must be 144 bytes");
 
 class Encoder {
 public:
     Encoder() = default;
 
+    static constexpr uint32_t INVALID_ID = 0xFFFFFFFFu;
+
+    /* Adds a triangle mesh and returns its geometry id, or INVALID_ID if the
+     * input is invalid (sizes not multiple of 3, non-finite coordinates or
+     * indices out of range). Identical meshes return the same id.
+     * Normals are accepted for API compatibility but not stored. */
     uint32_t add_geometry(const std::vector<float>& vertices,
                           const std::vector<float>& normals,
                           const std::vector<uint32_t>& indices);
 
-    void add_node(uint32_t geometry_id, 
+    /* Returns false if geometry_id does not exist or transform is null. */
+    bool add_node(uint32_t geometry_id, 
                   const double transform[16], 
                   uint32_t layer_color_rgba = 0xFFFFFFFF, 
                   uint32_t node_flags = 0);
+
+    /* Bits per coordinate for position quantization (1..16, default 16).
+     * Maximum error per axis = AABB extent / (2 * (2^bits - 1)).
+     * Applies to geometries added after the call. */
+    void set_quantization_bits(uint32_t bits);
+    uint32_t quantization_bits() const { return quantization_bits_; }
 
     bool write_memory(std::vector<uint8_t>& out_buffer) const;
     bool write_file(const std::string& filepath);
@@ -100,7 +103,21 @@ public:
 private:
     std::vector<GeometryData> geometries_;
     std::vector<SceneNode> nodes_;
-    
+    uint32_t quantization_bits_ = 16;
+
+    /* Deduplication index: hash -> ids of geometries with that hash.
+     * dedup_keys_[id] keeps the exact input bytes of each unique geometry,
+     * so that a hash match is confirmed byte by byte (no false merges). */
+    struct Hash256Hasher {
+        size_t operator()(const Hash256& h) const {
+            size_t v;
+            std::memcpy(&v, h.data(), sizeof(v));
+            return v;
+        }
+    };
+    std::unordered_map<Hash256, std::vector<uint32_t>, Hash256Hasher> dedup_index_;
+    std::vector<std::vector<uint8_t>> dedup_keys_;
+
     void calculate_aabb(const std::vector<float>& vertices, double min[3], double max[3]);
 };
 

@@ -1,6 +1,3 @@
 [submodule "external/HASH-G3-RH512-256"]
 	path = external/HASH-G3-RH512-256
 	url = https://github.com/garcialeal/HASH-G3-RH512-256.git
-[submodule "external/V4S12-MATHEMATICAL-CORE"]
-	path = external/V4S12-MATHEMATICAL-CORE
-	url = https://github.com/garcialeal/V4S12-MATHEMATICAL-CORE.git

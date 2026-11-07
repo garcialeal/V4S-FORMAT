@@ -21,95 +21,131 @@
  
 #include "v4s12/v4s12.h"
 #include "v4s12/types.h"
-#include "v4s12/spectral_pipeline.h"
 #include <fstream>
 #include <cstring>
 #include <zstd.h>
 #include <iostream>
 #include <vector>
+#include <cmath>
+#include <limits>
+#include <new>
 
 namespace v4s12 {
 
-bool Decoder::read_memory(const char* data, size_t file_size) {
-    if (file_size < sizeof(Header)) return false;
+namespace {
 
-    const char* ptr = data;
+// Fixed part of a geometry record: hash (32), AABB min/max (6 doubles),
+// vertex count, index count, quantization bits, payload size (4 x uint32).
+constexpr uint64_t kGeometryRecordBytes = 32 + 6 * sizeof(double) + 4 * sizeof(uint32_t);
 
-    // 1. Zero-Copy Header Reading
-    Header hdr;
-    std::memcpy(&hdr, ptr, sizeof(Header));
-    ptr = data + hdr.offset_hashtable; // Direct jump to nodes
+// Parses a complete .v4s buffer. Every size and offset is checked against
+// the buffer before it is used; on any inconsistency it returns false.
+bool parse_v4s(const char* data, uint64_t file_size, Header& hdr,
+               std::vector<SceneNode>& nodes, std::vector<GeometryData>& geometries) {
+    if (data == nullptr || file_size < sizeof(Header)) return false;
 
-    // 2. Zero-Copy Scene Graph Reading
-    nodes_.resize(hdr.num_nodes);
-    size_t nodes_size = hdr.num_nodes * sizeof(SceneNode);
-    std::memcpy(nodes_.data(), ptr, nodes_size);
-    ptr = data + hdr.offset_geometries; // Direct jump to geometries
+    // 1. Header
+    std::memcpy(&hdr, data, sizeof(Header));
+    static const char kMagic[4] = {'V', '4', 'S', '2'};
+    if (std::memcmp(hdr.magic, kMagic, sizeof(kMagic)) != 0) return false;
+    if (hdr.version != Header().version) return false;
 
-    geometries_.resize(hdr.num_geometries);
+    // 2. Scene nodes
+    if (hdr.offset_hashtable > file_size) return false;
+    const uint64_t nodes_bytes = static_cast<uint64_t>(hdr.num_nodes) * sizeof(SceneNode);
+    if (nodes_bytes > file_size - hdr.offset_hashtable) return false;
+    nodes.resize(hdr.num_nodes);
+    if (nodes_bytes > 0) {
+        std::memcpy(nodes.data(), data + hdr.offset_hashtable, static_cast<size_t>(nodes_bytes));
+    }
+    for (const SceneNode& n : nodes) {
+        if (n.geometry_id >= hdr.num_geometries) return false;
+    }
 
-    for (uint32_t i = 0; i < hdr.num_geometries; ++i) {
-        GeometryData& geom = geometries_[i];
+    // 3. Geometry records
+    if (hdr.offset_geometries > file_size) return false;
+    uint64_t pos = hdr.offset_geometries;
+    if (hdr.num_geometries > (file_size - pos) / kGeometryRecordBytes) return false;
+    geometries.resize(hdr.num_geometries);
 
-        // Geometry metadata extraction
-        std::memcpy(geom.hash.data(), ptr, 32); ptr += 32;
-        std::memcpy(geom.local_aabb_min, ptr, 3 * sizeof(double)); ptr += 3 * sizeof(double);
-        std::memcpy(geom.local_aabb_max, ptr, 3 * sizeof(double)); ptr += 3 * sizeof(double);
-        std::memcpy(&geom.original_vertex_count, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
-        std::memcpy(&geom.original_index_count, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+    for (GeometryData& geom : geometries) {
+        if (file_size - pos < kGeometryRecordBytes) return false;
+        const char* p = data + pos;
+        uint32_t payload_size = 0;
+        std::memcpy(geom.hash.data(), p, 32);                                p += 32;
+        std::memcpy(geom.local_aabb_min, p, 3 * sizeof(double));            p += 3 * sizeof(double);
+        std::memcpy(geom.local_aabb_max, p, 3 * sizeof(double));            p += 3 * sizeof(double);
+        std::memcpy(&geom.original_vertex_count, p, sizeof(uint32_t));      p += sizeof(uint32_t);
+        std::memcpy(&geom.original_index_count, p, sizeof(uint32_t));       p += sizeof(uint32_t);
+        std::memcpy(&geom.quantization_bits, p, sizeof(uint32_t));          p += sizeof(uint32_t);
+        std::memcpy(&payload_size, p, sizeof(uint32_t));
+        pos += kGeometryRecordBytes;
 
-        uint32_t payload_size;
-        std::memcpy(&payload_size, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+        if (geom.quantization_bits < 1 || geom.quantization_bits > 16) return false;
+        if (geom.original_index_count % 3 != 0) return false;
+        for (int axis = 0; axis < 3; ++axis) {
+            if (!std::isfinite(geom.local_aabb_min[axis]) || !std::isfinite(geom.local_aabb_max[axis]) ||
+                geom.local_aabb_min[axis] > geom.local_aabb_max[axis]) return false;
+        }
+        if (payload_size > file_size - pos) return false;
+        const char* payload = data + pos;
+        pos += payload_size;
 
-        // 3. On-Demand ZSTD Decompression (Payload Only)
-        size_t padded_vertex_count = geom.original_vertex_count * 3;
-        while (padded_vertex_count % 16 != 0) padded_vertex_count++;
-        
-        size_t spectral_bytes = padded_vertex_count * sizeof(v4s12_int_t);
-        size_t indices_bytes = geom.original_index_count * sizeof(uint32_t);
-        size_t uncompressed_size = spectral_bytes + indices_bytes;
+        // The ZSTD frame must declare exactly the size implied by the counts.
+        const uint64_t coord_count = static_cast<uint64_t>(geom.original_vertex_count) * 3;
+        const uint64_t position_bytes = coord_count * sizeof(uint16_t);
+        const uint64_t indices_bytes = static_cast<uint64_t>(geom.original_index_count) * sizeof(uint32_t);
+        const uint64_t expected = position_bytes + indices_bytes;
+        const unsigned long long frame_size = ZSTD_getFrameContentSize(payload, payload_size);
+        if (frame_size == ZSTD_CONTENTSIZE_ERROR || frame_size == ZSTD_CONTENTSIZE_UNKNOWN ||
+            frame_size != expected) return false;
+        if (expected > std::numeric_limits<size_t>::max()) return false;
 
-        std::vector<uint8_t> raw_payload(uncompressed_size);
-        size_t d_size = ZSTD_decompress(raw_payload.data(), uncompressed_size, ptr, payload_size);
-        if (ZSTD_isError(d_size)) return false;
-        ptr += payload_size;
+        std::vector<uint8_t> raw(static_cast<size_t>(expected));
+        const size_t d_size = ZSTD_decompress(raw.data(), raw.size(), payload, payload_size);
+        if (ZSTD_isError(d_size) || d_size != raw.size()) return false;
 
-        // 4. Mathematical Decoding: Inverse V4 + S12
-        const v4s12_int_t* spectral_payload = reinterpret_cast<const v4s12_int_t*>(raw_payload.data());
-        const uint32_t* indices_payload = reinterpret_cast<const uint32_t*>(raw_payload.data() + spectral_bytes);
+        // Indices must reference existing vertices.
+        geom.indices.resize(geom.original_index_count);
+        std::memcpy(geom.indices.data(), raw.data() + position_bytes, static_cast<size_t>(indices_bytes));
+        for (uint32_t index : geom.indices) {
+            if (index >= geom.original_vertex_count) return false;
+        }
 
-        geom.indices.assign(indices_payload, indices_payload + geom.original_index_count);
-        geom.vertices.reserve(geom.original_vertex_count * 3);
-
-        double range[3] = {
-            geom.local_aabb_max[0] - geom.local_aabb_min[0],
-            geom.local_aabb_max[1] - geom.local_aabb_min[1],
-            geom.local_aabb_max[2] - geom.local_aabb_min[2]
-        };
-
-        for (size_t b = 0; b < padded_vertex_count; b += 16) {
-            v4s12_int_t zigzag_block[16];
-            v4s12_int_t block[16];
-            std::memcpy(zigzag_block, &spectral_payload[b], 16 * sizeof(v4s12_int_t));
-
-            // Inverse Topo-Entropic Reordering
-            v4_zigzag_reorder_inv(zigzag_block, block);
-            
-            // Inverse Spectral Butterfly
-            v4_transform_2d_4x4_inv(block);
-
-            // S12 Dequantization and Reprojection to Float32
-            for (int k = 0; k < 16; ++k) {
-                size_t v_idx = b + k;
-                if (v_idx < geom.original_vertex_count * 3) {
-                    int axis = v_idx % 3;
-                    double normalized = s12_dequantize_spline(block[k]) / 4095.0;
-                    float real_val = static_cast<float>(geom.local_aabb_min[axis] + (normalized * range[axis]));
-                    geom.vertices.push_back(real_val);
-                }
-            }
+        // Dequantization: x = min + q / (2^bits - 1) * extent
+        std::vector<uint16_t> quantized(static_cast<size_t>(coord_count));
+        std::memcpy(quantized.data(), raw.data(), static_cast<size_t>(position_bytes));
+        const double levels = static_cast<double>((1u << geom.quantization_bits) - 1u);
+        geom.vertices.resize(static_cast<size_t>(coord_count));
+        for (size_t k = 0; k < quantized.size(); ++k) {
+            const size_t axis = k % 3;
+            const double extent = geom.local_aabb_max[axis] - geom.local_aabb_min[axis];
+            geom.vertices[k] = static_cast<float>(geom.local_aabb_min[axis] + (quantized[k] / levels) * extent);
         }
     }
+    return true;
+}
+
+} // namespace
+
+bool Decoder::read_memory(const char* data, size_t file_size) {
+    header_ = Header();
+    nodes_.clear();
+    geometries_.clear();
+
+    Header hdr;
+    std::vector<SceneNode> nodes;
+    std::vector<GeometryData> geometries;
+    try {
+        if (!parse_v4s(data, file_size, hdr, nodes, geometries)) return false;
+    } catch (const std::bad_alloc&) {
+        return false;  // declared sizes too large for available memory
+    }
+
+    // Only a fully valid file replaces the decoder state.
+    header_ = hdr;
+    nodes_ = std::move(nodes);
+    geometries_ = std::move(geometries);
     return true;
 }
 
@@ -117,13 +153,14 @@ bool Decoder::read_file(const std::string& filename) {
     std::ifstream file(filename, std::ios::binary | std::ios::ate);
     if (!file.is_open()) return false;
 
-    std::streamsize size = file.tellg();
+    const std::streamsize size = file.tellg();
+    if (size <= 0) return false;
     file.seekg(0, std::ios::beg);
 
-    std::vector<char> buffer(size);
+    std::vector<char> buffer(static_cast<size_t>(size));
     if (!file.read(buffer.data(), size)) return false;
 
-    return read_memory(buffer.data(), size);
+    return read_memory(buffer.data(), buffer.size());
 }
 
 } // namespace v4s12
