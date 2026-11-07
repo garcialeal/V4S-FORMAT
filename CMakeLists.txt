@@ -30,7 +30,11 @@ include(FetchContent)
 # 1. ZSTD Dependency (Dynamic on PC, Compiled from source for WASM)
 if(NOT EMSCRIPTEN)
     find_package(PkgConfig REQUIRED)
-    pkg_check_modules(ZSTD REQUIRED libzstd)
+    # IMPORTED_TARGET carries the include and library directories reported
+    # by pkg-config (needed when zstd is outside the default linker path,
+    # e.g. Homebrew on macOS in /opt/homebrew).
+    pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
+    set(ZSTD_LIBRARIES PkgConfig::ZSTD)
 else()
     FetchContent_Declare(
         zstd
