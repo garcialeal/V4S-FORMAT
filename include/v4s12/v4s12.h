@@ -75,11 +75,18 @@ class Encoder {
 public:
     Encoder() = default;
 
+    static constexpr uint32_t INVALID_ID = 0xFFFFFFFFu;
+
+    /* Adds a triangle mesh and returns its geometry id, or INVALID_ID if the
+     * input is invalid (sizes not multiple of 3, non-finite coordinates or
+     * indices out of range). Identical meshes return the same id.
+     * Normals are accepted for API compatibility but not stored. */
     uint32_t add_geometry(const std::vector<float>& vertices,
                           const std::vector<float>& normals,
                           const std::vector<uint32_t>& indices);
 
-    void add_node(uint32_t geometry_id, 
+    /* Returns false if geometry_id does not exist or transform is null. */
+    bool add_node(uint32_t geometry_id, 
                   const double transform[16], 
                   uint32_t layer_color_rgba = 0xFFFFFFFF, 
                   uint32_t node_flags = 0);

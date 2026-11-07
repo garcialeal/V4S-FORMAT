@@ -76,6 +76,21 @@ uint32_t Encoder::add_geometry(const std::vector<float>& vertices,
                                const std::vector<float>& normals,
                                const std::vector<uint32_t>& indices) {
                                
+    (void)normals;  // normals are not stored in format 3.0
+
+    // 0. Input validation: triangles only, finite coordinates, valid indices
+    if (vertices.empty() || vertices.size() % 3 != 0) return INVALID_ID;
+    if (indices.empty() || indices.size() % 3 != 0) return INVALID_ID;
+    if (vertices.size() / 3 > std::numeric_limits<uint32_t>::max() ||
+        indices.size() > std::numeric_limits<uint32_t>::max()) return INVALID_ID;
+    for (float x : vertices) {
+        if (!std::isfinite(x)) return INVALID_ID;
+    }
+    const size_t vertex_count = vertices.size() / 3;
+    for (uint32_t index : indices) {
+        if (index >= vertex_count) return INVALID_ID;
+    }
+
     // 1. Deduplication: RH512 hash of vertices + indices + quantization bits,
     //    looked up in a hash table and confirmed by exact byte comparison.
     std::vector<uint8_t> key = geometry_key(vertices, indices, quantization_bits_);
@@ -141,13 +156,15 @@ void Encoder::set_quantization_bits(uint32_t bits) {
     quantization_bits_ = bits;
 }
 
-void Encoder::add_node(uint32_t geometry_id, const double transform[16], uint32_t layer_color_rgba, uint32_t node_flags) {
+bool Encoder::add_node(uint32_t geometry_id, const double transform[16], uint32_t layer_color_rgba, uint32_t node_flags) {
+    if (transform == nullptr || geometry_id >= geometries_.size()) return false;
     SceneNode node;
     node.geometry_id = geometry_id;
     std::copy(transform, transform + 16, node.transform.begin());
     node.layer_color_rgba = layer_color_rgba;
     node.node_flags = node_flags;
     nodes_.push_back(node);
+    return true;
 }
 
 bool Encoder::write_memory(std::vector<uint8_t>& out_buffer) const {
