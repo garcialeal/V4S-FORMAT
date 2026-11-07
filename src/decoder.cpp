@@ -21,7 +21,6 @@
  
 #include "v4s12/v4s12.h"
 #include "v4s12/types.h"
-#include "v4s12/spectral_pipeline.h"
 #include <fstream>
 #include <cstring>
 #include <zstd.h>
@@ -57,57 +56,35 @@ bool Decoder::read_memory(const char* data, size_t file_size) {
         std::memcpy(geom.local_aabb_max, ptr, 3 * sizeof(double)); ptr += 3 * sizeof(double);
         std::memcpy(&geom.original_vertex_count, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
         std::memcpy(&geom.original_index_count, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+        std::memcpy(&geom.quantization_bits, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+        if (geom.quantization_bits < 1 || geom.quantization_bits > 16) return false;
 
         uint32_t payload_size;
         std::memcpy(&payload_size, ptr, sizeof(uint32_t)); ptr += sizeof(uint32_t);
 
-        // 3. On-Demand ZSTD Decompression (Payload Only)
-        size_t padded_vertex_count = geom.original_vertex_count * 3;
-        while (padded_vertex_count % 16 != 0) padded_vertex_count++;
-        
-        size_t spectral_bytes = padded_vertex_count * sizeof(v4s12_int_t);
-        size_t indices_bytes = geom.original_index_count * sizeof(uint32_t);
-        size_t uncompressed_size = spectral_bytes + indices_bytes;
+        // 3. ZSTD decompression of the payload
+        const size_t coord_count = static_cast<size_t>(geom.original_vertex_count) * 3;
+        const size_t position_bytes = coord_count * sizeof(uint16_t);
+        const size_t indices_bytes = static_cast<size_t>(geom.original_index_count) * sizeof(uint32_t);
+        const size_t uncompressed_size = position_bytes + indices_bytes;
 
         std::vector<uint8_t> raw_payload(uncompressed_size);
         size_t d_size = ZSTD_decompress(raw_payload.data(), uncompressed_size, ptr, payload_size);
-        if (ZSTD_isError(d_size)) return false;
+        if (ZSTD_isError(d_size) || d_size != uncompressed_size) return false;
         ptr += payload_size;
 
-        // 4. Mathematical Decoding: Inverse V4 + S12
-        const v4s12_int_t* spectral_payload = reinterpret_cast<const v4s12_int_t*>(raw_payload.data());
-        const uint32_t* indices_payload = reinterpret_cast<const uint32_t*>(raw_payload.data() + spectral_bytes);
+        // 4. Dequantization: x = min + q / (2^bits - 1) * extent
+        std::vector<uint16_t> quantized(coord_count);
+        std::memcpy(quantized.data(), raw_payload.data(), position_bytes);
+        geom.indices.resize(geom.original_index_count);
+        std::memcpy(geom.indices.data(), raw_payload.data() + position_bytes, indices_bytes);
 
-        geom.indices.assign(indices_payload, indices_payload + geom.original_index_count);
-        geom.vertices.reserve(geom.original_vertex_count * 3);
-
-        double range[3] = {
-            geom.local_aabb_max[0] - geom.local_aabb_min[0],
-            geom.local_aabb_max[1] - geom.local_aabb_min[1],
-            geom.local_aabb_max[2] - geom.local_aabb_min[2]
-        };
-
-        for (size_t b = 0; b < padded_vertex_count; b += 16) {
-            v4s12_int_t zigzag_block[16];
-            v4s12_int_t block[16];
-            std::memcpy(zigzag_block, &spectral_payload[b], 16 * sizeof(v4s12_int_t));
-
-            // Inverse Topo-Entropic Reordering
-            v4_zigzag_reorder_inv(zigzag_block, block);
-            
-            // Inverse Spectral Butterfly
-            v4_transform_2d_4x4_inv(block);
-
-            // S12 Dequantization and Reprojection to Float32
-            for (int k = 0; k < 16; ++k) {
-                size_t v_idx = b + k;
-                if (v_idx < geom.original_vertex_count * 3) {
-                    int axis = v_idx % 3;
-                    double normalized = s12_dequantize_spline(block[k]) / 4095.0;
-                    float real_val = static_cast<float>(geom.local_aabb_min[axis] + (normalized * range[axis]));
-                    geom.vertices.push_back(real_val);
-                }
-            }
+        const double levels = static_cast<double>((1u << geom.quantization_bits) - 1u);
+        geom.vertices.resize(coord_count);
+        for (size_t k = 0; k < coord_count; ++k) {
+            const size_t axis = k % 3;
+            const double extent = geom.local_aabb_max[axis] - geom.local_aabb_min[axis];
+            geom.vertices[k] = static_cast<float>(geom.local_aabb_min[axis] + (quantized[k] / levels) * extent);
         }
     }
     return true;

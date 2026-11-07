@@ -26,24 +26,7 @@
 #include <stddef.h>
 
 /* ========================================================================= */
-/* 1. C99 MATHEMATICAL CORE                                                 */
-/* ========================================================================= */
-
-#ifndef V4S12_INT_T_DEFINED
-#define V4S12_INT_T_DEFINED
-#ifdef V4S12_HIGH_PRECISION
-    typedef int64_t v4s12_int_t;
-#else
-    typedef int32_t v4s12_int_t;
-#endif
-#endif
-
-#include "v4s12/v4_transform.h"
-#include "v4s12/v4_zigzag.h"
-#include "v4s12/s12_quant.h"
-
-/* ========================================================================= */
-/* 2. .V4S CONTAINER AND SCENE LAYER (C++17)                                 */
+/* .V4S CONTAINER AND SCENE LAYER (C++17)                                    */
 /* ========================================================================= */
 
 #ifdef __cplusplus
@@ -60,7 +43,7 @@ namespace v4s12 {
 #pragma pack(push, 8)
 struct Header {
     char magic[4] = {'V', '4', 'S', '2'};
-    uint16_t version = 200;
+    uint16_t version = 300;  /* format 3.0: uniform quantization */
     uint16_t flags = 0;
     
     double global_aabb_min[3] = {0.0, 0.0, 0.0};
@@ -94,13 +77,20 @@ public:
                   uint32_t layer_color_rgba = 0xFFFFFFFF, 
                   uint32_t node_flags = 0);
 
+    /* Bits per coordinate for position quantization (1..16, default 16).
+     * Maximum error per axis = AABB extent / (2 * (2^bits - 1)).
+     * Applies to geometries added after the call. */
+    void set_quantization_bits(uint32_t bits);
+    uint32_t quantization_bits() const { return quantization_bits_; }
+
     bool write_memory(std::vector<uint8_t>& out_buffer) const;
     bool write_file(const std::string& filepath);
 
 private:
     std::vector<GeometryData> geometries_;
     std::vector<SceneNode> nodes_;
-    
+    uint32_t quantization_bits_ = 16;
+
     void calculate_aabb(const std::vector<float>& vertices, double min[3], double max[3]);
 };
 

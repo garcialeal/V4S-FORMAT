@@ -57,17 +57,17 @@ int main() {
     const auto& decoded_geometries = decoder.get_geometries();
     assert(decoded_geometries.size() == 1);
     
-    // Tolerance check (12-bit quantization has a minimal expected deviation)
+    // Tolerance check (quantization has a small expected deviation)
     const auto& dec_verts = decoded_geometries[0].vertices;
     assert(dec_verts.size() >= 9); // Padding adds extra vertices
     
     std::cout << "[TEST] Original vertex X: " << vertices[3] << " -> Restored X: " << dec_verts[3] << "\n";
-    std::cout << "[TEST] SUCCESS: The S12+V4+ZSTD pipeline is reversible.\n";
+    std::cout << "[TEST] SUCCESS: quantization + ZSTD round trip completed.\n";
     float max_error = 0.0f;
     for (size_t i = 0; i < vertices.size(); ++i) {
         float diff = std::abs(vertices[i] - dec_verts[i]);
         if (diff > max_error) max_error = diff;
     }
-    std::cout << "[TEST] Maximum S12 quantization error (Delta): " << max_error << " units\n";
+    std::cout << "[TEST] Maximum quantization error (Delta): " << max_error << " units\n";
     return 0;
 }

@@ -51,24 +51,18 @@ else()
     set(ZSTD_INCLUDE_DIRS ${zstd_SOURCE_DIR}/lib)
 endif()
 
-# Core library pointing strictly to external submodules for math & hash
+# Core library (hash from the HASH-G3-RH512-256 submodule)
 add_library(v4s12_lib STATIC
     src/encoder.cpp
     src/decoder.cpp
     src/mesh_optimizer.cpp
-    src/spectral_pipeline.cpp
     src/v4s12_c_api.cpp
     external/HASH-G3-RH512-256/src/g3_hash.c
-    external/V4S12-MATHEMATICAL-CORE/src/s12_quant.c
-    external/V4S12-MATHEMATICAL-CORE/src/v4_transform.c
-    external/V4S12-MATHEMATICAL-CORE/src/v4_zigzag.c
 )
 
 target_include_directories(v4s12_lib PUBLIC 
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/external/HASH-G3-RH512-256/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/external/V4S12-MATHEMATICAL-CORE/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/external/V4S12-MATHEMATICAL-CORE/include/v4s12
 )
 
 if(ZSTD_INCLUDE_DIRS)
